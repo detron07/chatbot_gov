@@ -24,8 +24,13 @@ class SemanticCacheManager:
         
         register_vector(self.conn)
         
-        # Modelo de embeddings
-        self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        # Modelo de embeddings (usa GPU se disponível)
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': device}
+        )
         
     def _obter_embedding(self, texto: str) -> list:
         # Gera o vetor usando o modelo do Google
@@ -62,7 +67,7 @@ class SemanticCacheManager:
                     
         return True, None
 
-    def registrar_ataque(self, texto: str, categoria: str, origem: str = "llm_judge"):
+    def registrar_ataque(self, texto: str, categoria: str, origem: str = "llm_judge", motivo: str = None):
         """
         Registra um novo ataque no cache semântico.
         """
@@ -71,10 +76,10 @@ class SemanticCacheManager:
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO cache_ataques (categoria, prompt_texto, embedding, origem) 
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO cache_ataques (categoria, prompt_texto, embedding, origem, motivo) 
+                VALUES (%s, %s, %s, %s, %s)
                 """,
-                (categoria, texto, vetor, origem)
+                (categoria, texto, vetor, origem, motivo)
             )
             self.conn.commit()
 

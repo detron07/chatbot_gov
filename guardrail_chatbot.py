@@ -123,7 +123,9 @@ llm_juiz = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
     temperature=0, 
-    model="openrouter/free"
+    model="openrouter/free",
+    max_retries=1,
+    timeout=15
 ) 
 
 import json
@@ -136,18 +138,23 @@ def fix_json_output(msg):
         if match:
             data = json.loads(match.group(0))
             if "properties" in data:
-                return json.dumps(data["properties"])
-            return match.group(0)
+                data = data["properties"]
+            # Fallback seguro caso o LLM gratuito invente um JSON inválido
+            if "is_seguro" not in data:
+                return json.dumps({"is_seguro": False, "motivo": "Falha de formatação do LLM (bloqueio preventivo)."})
+            return json.dumps(data)
     except Exception:
         pass
-    return text
+    return json.dumps({"is_seguro": False, "motivo": "Erro de parse do LLM (bloqueio preventivo)."})
 
 llm_juiz_fixed = llm_juiz | RunnableLambda(fix_json_output)
 llm_principal = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
     temperature=0.3, 
-    model="openrouter/free"
+    model="openrouter/free",
+    max_retries=1,
+    timeout=15
 )
 
 # Chains de Entrada
@@ -213,18 +220,27 @@ juizes_entrada = RunnableParallel({
 def is_entrada_segura(x):
     pergunta = x["pergunta"]
     
-    # Se algum juiz falhar, nós vacinamos o sistema registrando no cache
-    if not x["eng_social"].is_seguro:
-        if cache_manager: cache_manager.registrar_ataque(pergunta, "eng_social")
-        return False
-    if not x["dados_pessoais"].is_seguro:
-        if cache_manager: cache_manager.registrar_ataque(pergunta, "dados_pessoais")
-        return False
-    if not x["jailbreak"].is_seguro:
-        if cache_manager: cache_manager.registrar_ataque(pergunta, "jailbreak")
-        return False
+    falhas = []
+    if not x["eng_social"].is_seguro: falhas.append(("eng_social", x["eng_social"].motivo))
+    if not x["dados_pessoais"].is_seguro: falhas.append(("dados_pessoais", x["dados_pessoais"].motivo))
+    if not x["jailbreak"].is_seguro: falhas.append(("jailbreak", x["jailbreak"].motivo))
         
-    return True
+    if not falhas:
+        return True
+        
+    # Escolhe a categoria real do ataque (evita registrar o fallback genérico se outro juiz acertou)
+    categoria_final = falhas[0][0]
+    motivo_final = falhas[0][1]
+    for cat, motivo in falhas:
+        if "preventivo" not in motivo.lower() and "erro" not in motivo.lower():
+            categoria_final = cat
+            motivo_final = motivo
+            break
+            
+    if cache_manager: 
+        cache_manager.registrar_ataque(pergunta, categoria_final, motivo=motivo_final)
+        
+    return False
 
 # B. Sub-chain: Geração e Validação de Saída
 chain_geracao_com_saida = (
