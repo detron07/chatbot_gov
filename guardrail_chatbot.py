@@ -1,18 +1,35 @@
 import os
+import sys
+
+# Força o terminal do Windows a aceitar caracteres especiais (UTF-8)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+
 from dotenv import load_dotenv
 
 # Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
 
 # Verifica se a chave foi carregada
-if not os.getenv("GOOGLE_API_KEY"):
-    raise ValueError("A chave GOOGLE_API_KEY não foi encontrada. Verifique o arquivo .env.")
+if not os.getenv("OPENROUTER_API_KEY"):
+    raise ValueError("A chave OPENROUTER_API_KEY não foi encontrada. Verifique o arquivo .env.")
 
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import RunnableParallel, RunnableBranch
 from pydantic import BaseModel, Field
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnableLambda
+
+# Import do Helper do Cache Semântico
+from semantic_cache import SemanticCacheManager
+import logging
+
+try:
+    cache_manager = SemanticCacheManager()
+except Exception as e:
+    logging.warning(f"Não foi possível conectar ao DB. Cache semântico desativado. Erro: {e}")
+    cache_manager = None
 
 # =====================================================================
 # 1. DEFINIÇÃO DA ESTRUTURA DOS AVALIADORES (Juízes)
@@ -102,34 +119,62 @@ Retorne ESTRITAMENTE no formato JSON especificado.
 # 4. INICIALIZAÇÃO DOS MODELOS E CHAINS
 # =====================================================================
 
-llm_juiz = ChatGoogleGenerativeAI(temperature=0, model="gemini-1.5-flash") 
-llm_principal = ChatGoogleGenerativeAI(temperature=0.3, model="gemini-1.5-flash")
+llm_juiz = ChatOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    temperature=0, 
+    model="openrouter/free"
+) 
+
+import json
+import re
+
+def fix_json_output(msg):
+    text = msg.content if hasattr(msg, "content") else str(msg)
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            if "properties" in data:
+                return json.dumps(data["properties"])
+            return match.group(0)
+    except Exception:
+        pass
+    return text
+
+llm_juiz_fixed = llm_juiz | RunnableLambda(fix_json_output)
+llm_principal = ChatOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    temperature=0.3, 
+    model="openrouter/free"
+)
 
 # Chains de Entrada
 chain_eng_social = PromptTemplate(
     template=template_eng_social,
     input_variables=["pergunta"],
     partial_variables={"instrucoes_formato": instrucoes_formato}
-) | llm_juiz | parser_seguranca
+) | llm_juiz_fixed | parser_seguranca
 
 chain_dados_pessoais = PromptTemplate(
     template=template_dados_pessoais,
     input_variables=["pergunta"],
     partial_variables={"instrucoes_formato": instrucoes_formato}
-) | llm_juiz | parser_seguranca
+) | llm_juiz_fixed | parser_seguranca
 
 chain_jailbreak = PromptTemplate(
     template=template_jailbreak,
     input_variables=["pergunta"],
     partial_variables={"instrucoes_formato": instrucoes_formato}
-) | llm_juiz | parser_seguranca
+) | llm_juiz_fixed | parser_seguranca
 
 # Chain de Saída
 chain_juiz_saida = PromptTemplate(
     template=template_saida,
     input_variables=["pergunta", "resposta_llm"],
     partial_variables={"instrucoes_formato": instrucoes_formato}
-) | llm_juiz | parser_seguranca
+) | llm_juiz_fixed | parser_seguranca
 
 # Chain Principal (Responde à pergunta se passar nos guardrails)
 chain_geracao = (
@@ -142,7 +187,22 @@ chain_geracao = (
 # 5. FLUXO COMPLETO (TUDO EM UMA ÚNICA CHAIN LCEL)
 # =====================================================================
 
-# A. Agrupa os juízes de entrada e passa a pergunta adiante
+# Camada 0: Avaliação Rápida via Cache Semântico (pgvector)
+def avaliar_cache(x):
+    if not cache_manager:
+        return {"cache_seguro": True, "pergunta": x["pergunta"]} # Pula se cache estiver off
+        
+    pergunta = x["pergunta"]
+    seguro, categoria = cache_manager.verificar_ataque(pergunta)
+    
+    if not seguro:
+        return {"cache_seguro": False, "categoria": categoria, "pergunta": pergunta}
+        
+    return {"cache_seguro": True, "pergunta": pergunta}
+
+camada_0 = RunnableLambda(avaliar_cache)
+
+# A. Agrupa os juízes de entrada e passa a pergunta adiante (Camada 1)
 juizes_entrada = RunnableParallel({
     "eng_social": chain_eng_social,
     "dados_pessoais": chain_dados_pessoais,
@@ -151,7 +211,20 @@ juizes_entrada = RunnableParallel({
 })
 
 def is_entrada_segura(x):
-    return x["eng_social"].is_seguro and x["dados_pessoais"].is_seguro and x["jailbreak"].is_seguro
+    pergunta = x["pergunta"]
+    
+    # Se algum juiz falhar, nós vacinamos o sistema registrando no cache
+    if not x["eng_social"].is_seguro:
+        if cache_manager: cache_manager.registrar_ataque(pergunta, "eng_social")
+        return False
+    if not x["dados_pessoais"].is_seguro:
+        if cache_manager: cache_manager.registrar_ataque(pergunta, "dados_pessoais")
+        return False
+    if not x["jailbreak"].is_seguro:
+        if cache_manager: cache_manager.registrar_ataque(pergunta, "jailbreak")
+        return False
+        
+    return True
 
 # B. Sub-chain: Geração e Validação de Saída
 chain_geracao_com_saida = (
@@ -169,12 +242,20 @@ chain_geracao_com_saida = (
     )
 )
 
-# C. A Chain Completa Final
+# C. A Chain Completa Final (Unindo Camada 0, Camada 1 e Geração)
 chain_completa = (
-    juizes_entrada
+    camada_0
     | RunnableBranch(
-        (lambda x: not is_entrada_segura(x), lambda x: "desculpe, nao posso ajudar com isso"),
-        chain_geracao_com_saida
+        # Se barrado na Camada 0 (Cache Semântico)
+        (lambda x: not x.get("cache_seguro", True), lambda x: f"[BLOQUEADO PELA CAMADA 0 - CACHE] Tentativa similar ao ataque '{x['categoria']}' detectada em poucos milissegundos."),
+        # Se passou pela Camada 0, roda os Juízes LLM (Camada 1) e Geração
+        (
+            juizes_entrada
+            | RunnableBranch(
+                (lambda x: not is_entrada_segura(x), lambda x: "[BLOQUEADO PELA CAMADA 1 - LLM JUDGE] desculpe, nao posso ajudar com isso"),
+                chain_geracao_com_saida
+            )
+        )
     )
 )
 
