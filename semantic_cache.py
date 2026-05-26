@@ -1,83 +1,85 @@
 import os
-import psycopg2
-from pgvector.psycopg2 import register_vector
+from sqlalchemy import create_engine, Column, Integer, String, Float, select
+from sqlalchemy.orm import declarative_base, sessionmaker
+from pgvector.sqlalchemy import Vector
 from langchain_huggingface import HuggingFaceEmbeddings
 from dotenv import load_dotenv
 
 load_dotenv()
 
+Base = declarative_base()
+
+class CacheAtaque(Base):
+    __tablename__ = 'cache_ataques'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    categoria = Column(String)
+    prompt_texto = Column(String)
+    embedding = Column(Vector(384))
+    origem = Column(String)
+    risco_nota = Column(Float, nullable=True) 
+    motivo = Column(String, nullable=True)
+
 class SemanticCacheManager:
     def __init__(self):
-        # Conexão com o banco PostgreSQL
         db_url = os.getenv("DATABASE_URL")
         
         if db_url:
-            self.conn = psycopg2.connect(db_url)
+            if db_url.startswith("postgres://"):
+                db_url = db_url.replace("postgres://", "postgresql://", 1)
+            self.engine = create_engine(db_url)
         else:
-            self.conn = psycopg2.connect(
-                dbname=os.getenv("PG_DBNAME", "semantic_cache"),
-                user=os.getenv("PG_USER", "admin"),
-                password=os.getenv("PG_PASSWORD", "adminpassword"),
-                host=os.getenv("PG_HOST", "localhost"),
-                port=os.getenv("PG_PORT", "5432")
-            )
+            dbname = os.getenv("PG_DBNAME", "semantic_cache")
+            user = os.getenv("PG_USER", "admin")
+            password = os.getenv("PG_PASSWORD", "adminpassword")
+            host = os.getenv("PG_HOST", "localhost")
+            port = os.getenv("PG_PORT", "5432")
+            
+            db_url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+            self.engine = create_engine(db_url)
+            
+        self.Session = sessionmaker(bind=self.engine)
         
-        register_vector(self.conn)
-        
-        # Modelo de embeddings
         self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         
     def _obter_embedding(self, texto: str) -> list:
-        # Gera o vetor usando o modelo do Google
         return self.embeddings.embed_query(texto)
 
     def verificar_ataque(self, texto: str, threshold: float = 0.15) -> tuple[bool, str]:
-        """
-        Verifica se a entrada é similar a algum ataque armazenado no cache.
-        Retorna (True, None) se for seguro.
-        Retorna (False, categoria) se for detectado um ataque.
-        """
         vetor = self._obter_embedding(texto)
         
-        with self.conn.cursor() as cur:
-            # Faz a busca pelo vizinho mais próximo usando pgvector
-            # O operador <=> representa a distância do cosseno
-            cur.execute(
-                """
-                SELECT categoria, embedding <=> %s::vector AS distancia 
-                FROM cache_ataques 
-                ORDER BY distancia ASC 
-                LIMIT 1
-                """,
-                (vetor,)
-            )
+        with self.Session() as session:
+            distancia_expr = CacheAtaque.embedding.cosine_distance(vetor).label('distancia')
             
-            resultado = cur.fetchone()
+            stmt = select(CacheAtaque.categoria, distancia_expr)\
+                .order_by(distancia_expr.asc()).limit(1)
+                
+            resultado = session.execute(stmt).first()
             
             if resultado:
-                categoria, distancia = resultado
-                # Se a distância for menor que o threshold, significa que é muito similar a um ataque conhecido
+                categoria = resultado.categoria
+                distancia = resultado.distancia
+                
                 if distancia < threshold:
                     return False, categoria
                     
         return True, None
 
-    def registrar_ataque(self, texto: str, categoria: str, origem: str = "llm_judge"):
-        """
-        Registra um novo ataque no cache semântico.
-        """
+    def registrar_ataque(self, texto: str, categoria: str, risco_nota: float = 0.0, motivo: str = None, origem: str = "llm_judge"):
         vetor = self._obter_embedding(texto)
         
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO cache_ataques (categoria, prompt_texto, embedding, origem) 
-                VALUES (%s, %s, %s, %s)
-                """,
-                (categoria, texto, vetor, origem)
+        with self.Session() as session:
+            novo_ataque = CacheAtaque(
+                categoria=categoria,
+                prompt_texto=texto,
+                embedding=vetor,
+                origem=origem,
+                risco_nota=risco_nota,
+                motivo=motivo
             )
-            self.conn.commit()
+            session.add(novo_ataque)
+            session.commit()
 
     def __del__(self):
-        if hasattr(self, 'conn') and self.conn:
-            self.conn.close()
+        if hasattr(self, 'engine') and self.engine:
+            self.engine.dispose()
