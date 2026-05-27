@@ -171,17 +171,29 @@ def is_entrada_segura(entrada):
         
     return True
 
+def is_saida_segura(saida):
+    pergunta = saida["pergunta"]
+    avaliacao = saida["avaliacao_saida"]
+    
+    if not avaliacao.is_seguro and avaliacao.risco_nota > 6.0:
+        if cache_manager: 
+            cache_manager.registrar_ataque(pergunta, "vazamento_dados", risco_nota=avaliacao.risco_nota, motivo=avaliacao.motivo, origem="llm_judge_saida")
+        return False
+        
+    return True
+
 chain_geracao_com_saida = (
     RunnableParallel({
         "pergunta": lambda x: x["pergunta"],
         "resposta_llm": chain_geracao
     })
     | RunnableParallel({
+        "pergunta": lambda x: x["pergunta"],
         "resposta_llm": lambda x: x["resposta_llm"],
         "avaliacao_saida": chain_juiz_saida
     })
     | RunnableBranch(
-        (lambda x: not x["avaliacao_saida"].is_seguro and x["avaliacao_saida"].risco_nota > 6.0, lambda x: "desculpe, nao posso ajudar com isso"),
+        (lambda x: not is_saida_segura(x), lambda x: "[BLOQUEADO PELA CAMADA 2 - LLM JUDGE SAÍDA] desculpe, nao posso ajudar com isso"),
         lambda x: x["resposta_llm"]
     )
 )
